@@ -6,6 +6,7 @@ Command line argument should be either 'gpt-4' or 'gpt-35-turbo'
 
 from kg_rag.utility import *
 import sys
+import re
 
 
 from tqdm import tqdm
@@ -40,11 +41,35 @@ MODE = "0"
 ### MODE 1: jsonlize the context from KG search ### 
 ### MODE 2: Add the prior domain knowledge      ### 
 ### MODE 3: Combine MODE 1 & 2                  ### 
+### MODE 4: Filter context                      ### 
+
+# For mode 2 / 3
+prior_domain_knowledge = """Related diseases often share gene associations. Variants follow the disease patterns of their genes. Ontology IDs are identifiers only. Disease–disease relations imply shared biology. Symptoms and provenance do not affect gene associations. Always return exactly one answer. Use context evidence first; only when every candidate has zero context evidence should you rely on prior biological knowledge to choose the most plausible candidate."""
+
+# For mode 4
+filter_prompt = """
+You are given a JSON string containing disease context. Filter it so that it keeps only information
+that is useful for answering the question. Keep entries that directly mention any candidate answer
+or that could help infer a relation to a candidate (for example, associations like "Disease X is
+associated with gene Y" may support a candidate gene Z if Y and Z are related). Remove clearly
+irrelevant or uninformative entries. Return only the filtered JSON string.
+
+Input JSON:
+{json_str}
+
+Candidates:
+{candidate_list}
+
+Filtered JSON:
+"""
+
 
 def main():
     start_time = time.time()
     question_df = pd.read_csv(QUESTION_PATH)
+    
     answer_list = []
+    detailed_answer_list = []  # just for recording Mode 4 outputs
     
     for index, row in tqdm(question_df.iterrows(), total=306):
         try: 
@@ -58,17 +83,32 @@ def main():
             if MODE == "1":
                 ### MODE 1: jsonlize the context from KG search ### 
                 ### Please implement the first strategy here    ###
-                output = '...'
+                context = retrieve_context_jsonize(row["text"], vectorstore, embedding_function_for_context_retrieval, node_context_df, CONTEXT_VOLUME, QUESTION_VS_CONTEXT_SIMILARITY_PERCENTILE_THRESHOLD, QUESTION_VS_CONTEXT_MINIMUM_SIMILARITY, edge_evidence, model_id=CHAT_MODEL_ID)
+                enriched_prompt = "Question: "+ question + "\nContext: "+ context
+                output = get_Gemini_response(enriched_prompt, SYSTEM_PROMPT, temperature=TEMPERATURE)
 
             if MODE == "2":
                 ### MODE 2: Add the prior domain knowledge      ### 
                 ### Please implement the second strategy here   ###
-                output = '...'
+                context = retrieve_context(row["text"], vectorstore, embedding_function_for_context_retrieval, node_context_df, CONTEXT_VOLUME, QUESTION_VS_CONTEXT_SIMILARITY_PERCENTILE_THRESHOLD, QUESTION_VS_CONTEXT_MINIMUM_SIMILARITY, edge_evidence, model_id=CHAT_MODEL_ID)
+                enriched_prompt = "\nQuestion: "+ question + "\n" + prior_domain_knowledge + "\nContext: "+ context # no "guess", Q -> prior -> context.
+                output = get_Gemini_response(enriched_prompt, SYSTEM_PROMPT, temperature=TEMPERATURE)
             
             if MODE == "3":
                 ### MODE 3: Combine MODE 1 & 2                  ### 
                 ### Please implement the third strategy here    ###
-                output = '...'
+                context = retrieve_context_jsonize(row["text"], vectorstore, embedding_function_for_context_retrieval, node_context_df, CONTEXT_VOLUME, QUESTION_VS_CONTEXT_SIMILARITY_PERCENTILE_THRESHOLD, QUESTION_VS_CONTEXT_MINIMUM_SIMILARITY, edge_evidence, model_id=CHAT_MODEL_ID)
+                enriched_prompt = "\nQuestion: "+ question + "\n" + prior_domain_knowledge + "\nContext: "+ context # no "guess", Q -> prior -> context.
+                output = get_Gemini_response(enriched_prompt, SYSTEM_PROMPT, temperature=TEMPERATURE)
+
+            if MODE == "4":
+                ### MODE 4: Mode 3 + a second LLM filter        ###
+                context = retrieve_context_jsonize(row["text"], vectorstore, embedding_function_for_context_retrieval, node_context_df, CONTEXT_VOLUME, QUESTION_VS_CONTEXT_SIMILARITY_PERCENTILE_THRESHOLD, QUESTION_VS_CONTEXT_MINIMUM_SIMILARITY, edge_evidence, model_id=CHAT_MODEL_ID)
+                candidate_list = re.search(r'Given list is:\s*(.*)$', question).group(1)
+                filtered_context = get_Gemini_response(filter_prompt.format(json_str=context, candidate_list=candidate_list), SYSTEM_PROMPT, temperature=TEMPERATURE)
+                enriched_prompt = "\nQuestion: "+ question + "\n" + prior_domain_knowledge + "\nContext: "+ filtered_context
+                output = get_Gemini_response(enriched_prompt, SYSTEM_PROMPT, temperature=TEMPERATURE)
+                detailed_answer_list.append((row["text"], row["correct_node"], output, context, filtered_context))
 
             answer_list.append((row["text"], row["correct_node"], output))
         except Exception as e:
@@ -82,6 +122,16 @@ def main():
     answer_df.to_csv(output_file, index=False, header=True) 
     print("Save the model outputs in ", output_file)
     print("Completed in {} min".format((time.time()-start_time)/60))
+
+    # to look at the shortened contexts
+    if MODE == "4" and len(detailed_answer_list) > 0:
+        save_for_context = "_".join(CHAT_MODEL_ID.split("-"))+"_kg_rag_based_mcq_{mode}_contexts.csv"
+        output_file_mode4 = os.path.join(SAVE_PATH, f"{save_for_context}".format(mode=MODE))
+        detailed_df = pd.DataFrame(
+            detailed_answer_list,
+            columns=["question", "correct_answer", "llm_answer", "original_context", "shortened_context"]
+        )
+        detailed_df.to_csv(output_file_mode4, index=False, header=True)
 
         
         

@@ -19,7 +19,7 @@ from kg_rag.config_loader import *
 import ast
 import requests
 import google.generativeai as genai
-
+import uuid
 
 memory = Memory("cachegpt", verbose=0)
 
@@ -367,8 +367,140 @@ def retrieve_context(question, vectorstore, embedding_function, node_context_df,
                 node_context_extracted += ". ".join(high_similarity_context)
                 node_context_extracted += ". "
         return node_context_extracted
-    
-    
+
+# some utility regex fn for retrieve_context_jsonize
+# basically, we first find "Disease" then scan for "associates" or for "." => take the other entity and push it under the node
+# this fn takes high_similarity_context for that node, returning the node/disease's dict
+def json_disease(high_similarity_context):
+    import re
+
+    disease_first = re.compile(
+        r'^Disease (.+) associates ([A-Z][a-z]+) (.+)\.?$'
+    )
+    disease_last = re.compile(
+        r'^([A-Z][a-z]+) (.+) associates Disease (.+)\.?$'
+    )
+
+    disease_id = re.compile(
+        r'^Disease ontology identifier of (.+) is DOID:([0-9]+)\.?$'
+    )
+    disease_related = re.compile(  # for Disease resembles / Disease isa or whatever
+        r'^Disease (.+) ([a-z ]+) Disease (.+)\.?$'
+    )
+
+    out = {}
+
+    for sent in high_similarity_context:
+
+        m = (
+            disease_first.match(sent)
+            or disease_last.match(sent)
+            or disease_id.match(sent)
+            or disease_related.match(sent)
+        )
+        if not m:
+            # put raw line into a flat "other_associations" list
+            out.setdefault("other_associations", []).append(sent)
+            continue
+
+        if m.re is disease_first:
+            assoc_type = m.group(2)
+            assoc_name = m.group(3)
+
+        elif m.re is disease_last:
+            assoc_type = m.group(1)
+            assoc_name = m.group(2)
+
+        elif m.re is disease_id:
+            # store as a single string
+            out.setdefault("Disease Ontology ID", m.group(2))
+            continue
+
+        else:  # Disease–Disease
+            relation = m.group(2).strip()
+            other_disease = m.group(3)
+            # keep same structure for disease–disease (unchanged)
+            out.setdefault("Disease Associations", []).append({relation: other_disease})
+            continue
+
+        # flatten genes/variants
+        if assoc_type == "Gene":
+            out.setdefault("genes", []).append(assoc_name)
+        elif assoc_type == "Variant":
+            out.setdefault("variants", []).append(assoc_name)
+        else:
+            # for everything else, drop flat into other_associations
+            out.setdefault("other_associations", []).append(f"{assoc_type}: {assoc_name}")
+
+    return out
+
+
+def retrieve_context_jsonize(question, vectorstore, embedding_function, node_context_df, context_volume, context_sim_threshold, context_sim_min_threshold, edge_evidence,model_id="gpt-3.5-turbo", api=False):
+    print("question:", question)
+    entities = disease_entity_extractor_v2(question, model_id)
+    print("entities:", entities)
+    out = {"Diseases":{}}
+    node_hits = []
+    if entities:
+        max_number_of_high_similarity_context_per_node = int(context_volume/len(entities))
+        for entity in entities:
+            node_search_result = vectorstore.similarity_search_with_score(entity, k=1)
+            node_hits.append(node_search_result[0][0].page_content)
+        question_embedding = embedding_function.embed_query(question)
+        node_context_extracted = ""
+        for node_name in node_hits:
+            if not api:
+                node_context = node_context_df[node_context_df.node_name == node_name].node_context.values[0]
+            else:
+                node_context,context_table = get_context_using_spoke_api(node_name)
+            node_context_list = node_context.split(". ")        
+            node_context_embeddings = embedding_function.embed_documents(node_context_list)
+            similarities = [cosine_similarity(np.array(question_embedding).reshape(1, -1), np.array(node_context_embedding).reshape(1, -1)) for node_context_embedding in node_context_embeddings]
+            similarities = sorted([(e, i) for i, e in enumerate(similarities)], reverse=True)
+            percentile_threshold = np.percentile([s[0] for s in similarities], context_sim_threshold)
+            high_similarity_indices = [s[1] for s in similarities if s[0] > percentile_threshold and s[0] > context_sim_min_threshold]
+            if len(high_similarity_indices) > max_number_of_high_similarity_context_per_node:
+                high_similarity_indices = high_similarity_indices[:max_number_of_high_similarity_context_per_node]
+            high_similarity_context = [node_context_list[index] for index in high_similarity_indices]            
+            if edge_evidence:
+                high_similarity_context = list(map(lambda x:x+'.', high_similarity_context)) 
+                context_table = context_table[context_table.context.isin(high_similarity_context)]
+                context_table.loc[:, "context"] =  context_table.source + " " + context_table.predicate.str.lower() + " " + context_table.target + " and Provenance of this association is " + context_table.provenance + " and attributes associated with this association is in the following JSON format:\n " + context_table.evidence.astype('str') + "\n\n"                
+                node_context_extracted += context_table.context.str.cat(sep=' ')
+            else:
+                out["Diseases"][node_name] = json_disease(high_similarity_context)
+        return json.dumps(out, indent=2)
+
+    else:
+        node_hits = vectorstore.similarity_search_with_score(question, k=5)
+        max_number_of_high_similarity_context_per_node = int(context_volume/5)
+        question_embedding = embedding_function.embed_query(question)
+        node_context_extracted = ""
+        for node in node_hits:
+            node_name = node[0].page_content
+            if not api:
+                node_context = node_context_df[node_context_df.node_name == node_name].node_context.values[0]
+            else:
+                node_context, context_table = get_context_using_spoke_api(node_name)
+            node_context_list = node_context.split(". ")        
+            node_context_embeddings = embedding_function.embed_documents(node_context_list)
+            similarities = [cosine_similarity(np.array(question_embedding).reshape(1, -1), np.array(node_context_embedding).reshape(1, -1)) for node_context_embedding in node_context_embeddings]
+            similarities = sorted([(e, i) for i, e in enumerate(similarities)], reverse=True)
+            percentile_threshold = np.percentile([s[0] for s in similarities], context_sim_threshold)
+            high_similarity_indices = [s[1] for s in similarities if s[0] > percentile_threshold and s[0] > context_sim_min_threshold]
+            if len(high_similarity_indices) > max_number_of_high_similarity_context_per_node:
+                high_similarity_indices = high_similarity_indices[:max_number_of_high_similarity_context_per_node]
+            high_similarity_context = [node_context_list[index] for index in high_similarity_indices]
+            if edge_evidence:
+                high_similarity_context = list(map(lambda x:x+'.', high_similarity_context))
+                context_table = context_table[context_table.context.isin(high_similarity_context)]
+                context_table.loc[:, "context"] =  context_table.source + " " + context_table.predicate.str.lower() + " " + context_table.target + " and Provenance of this association is " + context_table.provenance + " and attributes associated with this association is in the following JSON format:\n " + context_table.evidence.astype('str') + "\n\n"                
+                node_context_extracted += context_table.context.str.cat(sep=' ')
+            else:
+                out["Diseases"][node_name] = json_disease(high_similarity_context)
+        return json.dumps(out, indent=2)
+
+
 def interactive(question, vectorstore, node_context_df, embedding_function_for_context_retrieval, llm_type, edge_evidence, system_prompt, api=True, llama_method="method-1"):
     print(" ")
     input("Press enter for Step 1 - Disease entity extraction using GPT-3.5-Turbo")
